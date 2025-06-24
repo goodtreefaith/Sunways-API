@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: sunways-proxy
+    env: python
+    buildCommand: echo "No build needed"
+    startCommand: python app.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
