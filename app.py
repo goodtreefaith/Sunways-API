@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Sunways API Proxy for Render.com
-Fixes SSL handshake issues by proxying requests to api.sunways-portal.com
+Sunways API Proxy for Render.com with Session Management
+Fixes SSL handshake issues and properly forwards authentication sessions
 """
 
 import os
@@ -10,6 +10,7 @@ import urllib.request
 import urllib.parse
 import ssl
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.cookies import SimpleCookie
 import logging
 
 # Configure logging
@@ -17,7 +18,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class SunwaysProxyHandler(BaseHTTPRequestHandler):
-    """HTTP request handler that proxies requests to Sunways API"""
+    """HTTP request handler that proxies requests to Sunways API with session management"""
     
     def log_message(self, format, *args):
         """Override to use proper logging"""
@@ -27,7 +28,8 @@ class SunwaysProxyHandler(BaseHTTPRequestHandler):
         """Send CORS headers to allow cross-origin requests"""
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization, Cookie')
+        self.send_header('Access-Control-Allow-Credentials', 'true')
     
     def do_OPTIONS(self):
         """Handle preflight CORS requests"""
@@ -55,6 +57,11 @@ class SunwaysProxyHandler(BaseHTTPRequestHandler):
                 'Referer': 'https://www.sunways-portal.com/',
             }
             
+            # Forward cookies from client to API
+            if 'Cookie' in self.headers:
+                headers['Cookie'] = self.headers['Cookie']
+                logger.info(f"Forwarding cookies: {self.headers['Cookie']}")
+            
             # Copy Authorization header if present
             if 'Authorization' in self.headers:
                 headers['Authorization'] = self.headers['Authorization']
@@ -76,6 +83,13 @@ class SunwaysProxyHandler(BaseHTTPRequestHandler):
                 self.send_response(response_code)
                 self.send_header('Content-Type', 'application/json')
                 self._send_cors_headers()
+                
+                # Forward Set-Cookie headers from API to client
+                for header_name, header_value in response.headers.items():
+                    if header_name.lower() == 'set-cookie':
+                        self.send_header('Set-Cookie', header_value)
+                        logger.info(f"Forwarding Set-Cookie: {header_value}")
+                
                 self.end_headers()
                 self.wfile.write(response_data)
                 
@@ -114,6 +128,11 @@ class SunwaysProxyHandler(BaseHTTPRequestHandler):
                 'Referer': 'https://www.sunways-portal.com/',
             }
             
+            # Forward cookies from client to API
+            if 'Cookie' in self.headers:
+                headers['Cookie'] = self.headers['Cookie']
+                logger.info(f"Forwarding cookies: {self.headers['Cookie']}")
+            
             # Copy Authorization header if present
             if 'Authorization' in self.headers:
                 headers['Authorization'] = self.headers['Authorization']
@@ -135,6 +154,13 @@ class SunwaysProxyHandler(BaseHTTPRequestHandler):
                 self.send_response(response_code)
                 self.send_header('Content-Type', 'application/json')
                 self._send_cors_headers()
+                
+                # Forward Set-Cookie headers from API to client
+                for header_name, header_value in response.headers.items():
+                    if header_name.lower() == 'set-cookie':
+                        self.send_header('Set-Cookie', header_value)
+                        logger.info(f"Forwarding Set-Cookie: {header_value}")
+                
                 self.end_headers()
                 self.wfile.write(response_data)
                 
@@ -181,7 +207,7 @@ def run_server():
     
     server = HTTPServer(('0.0.0.0', port), SunwaysProxyHandler)
     
-    logger.info(f"Starting Sunways Proxy Server on port {port}")
+    logger.info(f"Starting Sunways Proxy Server with Session Management on port {port}")
     logger.info(f"Proxying requests to: https://api.sunways-portal.com")
     
     try:
