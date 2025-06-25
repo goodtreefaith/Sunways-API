@@ -2,48 +2,40 @@
 
 #!/usr/bin/env python3
 """
-Sunways API Proxy for Render.com with Session Management
-Fixes SSL handshake issues, forwards authentication, and handles gzip compression.
+Sunways API Proxy for Render.com
+- Mimics a real browser to ensure a session cookie is issued.
+- Forwards the session cookie back to Home Assistant.
+- Handles gzip compression automatically.
 """
 
 import os
 import json
 import urllib.request
-import urllib.parse
 import ssl
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import logging
-import gzip  # Import the gzip library
+import gzip
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 class SunwaysProxyHandler(BaseHTTPRequestHandler):
-    """HTTP request handler that proxies requests to Sunways API with session management"""
-    
-    def log_message(self, format, *args):
-        """Override to use proper logging"""
-        logger.info(f"{self.address_string()} - {format % args}")
     
     def _send_cors_headers(self):
-        """Send CORS headers to allow cross-origin requests"""
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization, Cookie, X-Requested-With, ver')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, X-Requested-With, ver, token')
         self.send_header('Access-Control-Allow-Credentials', 'true')
     
     def do_OPTIONS(self):
-        """Handle preflight CORS requests"""
         self.send_response(204, "No Content")
         self._send_cors_headers()
         self.end_headers()
     
     def _proxy_request(self, method):
-        """Generic proxy handler for GET and POST"""
         try:
             target_url = f"https://api.sunways-portal.com{self.path}"
-            logger.info(f"Proxying {method} request to: {target_url}")
             
             post_data = b''
             if method == 'POST':
@@ -51,55 +43,60 @@ class SunwaysProxyHandler(BaseHTTPRequestHandler):
                 if content_length > 0:
                     post_data = self.rfile.read(content_length)
             
-            headers = {key: value for key, value in self.headers.items() if key.lower() not in ['host', 'connection', 'accept-encoding']}
-            headers['Host'] = 'api.sunways-portal.com'
-            # Tell the server we can handle gzip, but we will decompress it ourselves
-            headers['Accept-Encoding'] = 'gzip, deflate'
+            # --- START OF THE CRITICAL FIX ---
+            # Hardcode headers to look exactly like a real browser request.
+            # This is the key to getting the API to issue a Set-Cookie header.
+            headers = {
+                'Host': 'api.sunways-portal.com',
+                'Connection': 'keep-alive',
+                'Accept': 'application/json, text/javascript, */*; q=0.01',
+                'Content-Type': 'application/json; charset=UTF-8',
+                'X-Requested-With': 'XMLHttpRequest',
+                'ver': 'pc',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Origin': 'https://www.sunways-portal.com',
+                'Referer': 'https://www.sunways-portal.com/',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'Accept-Language': 'en-US,en;q=0.9',
+            }
+            # --- END OF THE CRITICAL FIX ---
+
+            # If the client (HA) sends a token header for subsequent requests, use it.
+            if 'token' in self.headers:
+                headers['Cookie'] = f"token={self.headers['token']}"
 
             ssl_context = ssl.create_default_context()
             req = urllib.request.Request(target_url, data=post_data, headers=headers, method=method)
             
             with urllib.request.urlopen(req, timeout=60, context=ssl_context) as response:
                 response_data = response.read()
-                response_code = response.getcode()
                 
-                # --- START OF THE GZIP FIX ---
                 if response.info().get('Content-Encoding') == 'gzip':
                     logger.info("Response is gzipped. Decompressing...")
                     response_data = gzip.decompress(response_data)
-                # --- END OF THE GZIP FIX ---
 
-                logger.info(f"Sunways API responded with status: {response_code}")
+                self.send_response(response.getcode())
                 
-                self.send_response(response_code)
-                
-                for header_name, header_value in response.headers.items():
-                    # Don't forward the original Content-Encoding or Content-Length
-                    # as we have decompressed the content.
-                    if header_name.lower() not in ['set-cookie', 'transfer-encoding', 'connection', 'content-encoding', 'content-length']:
-                        self.send_header(header_name, header_value)
+                # Forward necessary headers
+                self.send_header('Content-Type', response.headers.get('Content-Type', 'application/json'))
+                self._send_cors_headers()
 
+                # Explicitly look for and forward the Set-Cookie header
                 cookie_headers = response.headers.get_all('Set-Cookie')
                 if cookie_headers:
                     for cookie in cookie_headers:
                         self.send_header('Set-Cookie', cookie)
-                        logger.info(f"Forwarding Set-Cookie header: {cookie}")
+                        logger.info(f"SUCCESS: Found and forwarded Set-Cookie header: {cookie.split(';')[0]}")
                 
-                self._send_cors_headers()
                 self.end_headers()
                 self.wfile.write(response_data)
                 
-        except urllib.error.HTTPError as e:
-            logger.error(f"HTTP error from Sunways API: {e.code} - {e.reason}")
-            error_data = e.read()
-            self.send_response(e.code)
-            self.send_header('Content-Type', 'application/json')
-            self._send_cors_headers()
-            self.end_headers()
-            self.wfile.write(error_data)
         except Exception as e:
             logger.error(f"Unexpected error in proxy: {str(e)}", exc_info=True)
-            self._send_error_response(500, f"Internal proxy error: {str(e)}")
+            self.send_response(500)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "Internal Proxy Error", "details": str(e)}).encode())
 
     def do_GET(self):
         self._proxy_request('GET')
@@ -107,28 +104,13 @@ class SunwaysProxyHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         self._proxy_request('POST')
 
-    def _send_error_response(self, status_code, message):
-        """Send a JSON error response"""
-        self.send_response(status_code)
-        self.send_header('Content-Type', 'application/json')
-        self._send_cors_headers()
-        self.end_headers()
-        error_data = {"error": message, "status": status_code}
-        self.wfile.write(json.dumps(error_data).encode())
-
 def run_server():
-    """Start the proxy server"""
     port = int(os.environ.get('PORT', 8080))
     server_address = ('0.0.0.0', port)
     httpd = HTTPServer(server_address, SunwaysProxyHandler)
     
     logger.info(f"Starting Sunways Proxy Server on port {port}")
-    try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    httpd.server_close()
-    logger.info("Server stopped.")
+    httpd.serve_forever()
 
 if __name__ == '__main__':
     run_server()
