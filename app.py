@@ -3,7 +3,7 @@
 #!/usr/bin/env python3
 """
 Sunways API Proxy for Render.com with Session Management
-Fixes SSL handshake issues and properly forwards authentication sessions
+Fixes SSL handshake issues, forwards authentication, and handles gzip compression.
 """
 
 import os
@@ -13,6 +13,7 @@ import urllib.parse
 import ssl
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import logging
+import gzip  # Import the gzip library
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -50,9 +51,10 @@ class SunwaysProxyHandler(BaseHTTPRequestHandler):
                 if content_length > 0:
                     post_data = self.rfile.read(content_length)
             
-            # Prepare headers for Sunways API, forwarding from client
-            headers = {key: value for key, value in self.headers.items() if key.lower() not in ['host', 'connection']}
+            headers = {key: value for key, value in self.headers.items() if key.lower() not in ['host', 'connection', 'accept-encoding']}
             headers['Host'] = 'api.sunways-portal.com'
+            # Tell the server we can handle gzip, but we will decompress it ourselves
+            headers['Accept-Encoding'] = 'gzip, deflate'
 
             ssl_context = ssl.create_default_context()
             req = urllib.request.Request(target_url, data=post_data, headers=headers, method=method)
@@ -61,25 +63,27 @@ class SunwaysProxyHandler(BaseHTTPRequestHandler):
                 response_data = response.read()
                 response_code = response.getcode()
                 
+                # --- START OF THE GZIP FIX ---
+                if response.info().get('Content-Encoding') == 'gzip':
+                    logger.info("Response is gzipped. Decompressing...")
+                    response_data = gzip.decompress(response_data)
+                # --- END OF THE GZIP FIX ---
+
                 logger.info(f"Sunways API responded with status: {response_code}")
                 
                 self.send_response(response_code)
                 
-                # Forward all headers from API to client, especially Content-Type
                 for header_name, header_value in response.headers.items():
-                    if header_name.lower() not in ['set-cookie', 'transfer-encoding', 'connection', 'content-encoding']:
+                    # Don't forward the original Content-Encoding or Content-Length
+                    # as we have decompressed the content.
+                    if header_name.lower() not in ['set-cookie', 'transfer-encoding', 'connection', 'content-encoding', 'content-length']:
                         self.send_header(header_name, header_value)
 
-                # --- START OF THE CRITICAL FIX ---
-                # Use get_all() to reliably get all Set-Cookie headers
                 cookie_headers = response.headers.get_all('Set-Cookie')
                 if cookie_headers:
                     for cookie in cookie_headers:
                         self.send_header('Set-Cookie', cookie)
-                        logger.info(f"SUCCESS: Forwarding Set-Cookie header: {cookie}")
-                else:
-                    logger.warning("WARNING: No Set-Cookie header found in response from Sunways API.")
-                # --- END OF THE CRITICAL FIX ---
+                        logger.info(f"Forwarding Set-Cookie header: {cookie}")
                 
                 self._send_cors_headers()
                 self.end_headers()
