@@ -1,55 +1,57 @@
-# app.py for Render.com (with token-to-cookie translation)
+# app.py for Render.com (Final, Deliberate Version)
 import os
 import requests
-from flask import Flask, request, Response, jsonify
+from flask import Flask, request, Response
 import logging
 
+# Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-
 TARGET_BASE_URL = "https://api.sunways-portal.com"
 
 @app.route('/<path:subpath>', methods=['GET', 'POST'])
 def proxy(subpath):
-    """A robust proxy that translates the token header to a cookie."""
-    
+    """
+    A deliberate proxy that explicitly constructs headers for the upstream request,
+    ensuring the 'token' is handled correctly.
+    """
     url = f"{TARGET_BASE_URL}/{subpath}"
-    headers = {key: value for (key, value) in request.headers if key.lower() != 'host'}
-    data = request.get_data()
-    
     logger.info(f"Proxying {request.method} for path: {subpath}")
 
     # --- START OF THE FINAL FIX ---
-    # The Sunways API expects the token back as a cookie, not a header.
-    # We must translate the 'token' header from HA into a 'Cookie' header for Sunways.
-    if 'token' in headers:
-        token_value = headers['token']
-        headers['Cookie'] = f'token={token_value}'
-        # Remove the original token header to avoid any confusion
-        del headers['token']
-        logger.info("Translated 'token' header to 'Cookie' header for upstream request.")
-    # --- END OF THE FINAL FIX ---
+    # Create a fresh, clean dictionary for the headers to be sent to Sunways.
+    upstream_headers = {
+        'Accept': 'application/json, text/javascript, */*; q=0.01',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'X-Requested-With': 'XMLHttpRequest',
+        'ver': 'pc'
+    }
 
+    # Explicitly check for the 'token' and 'Content-Type' headers from the incoming
+    # request from Home Assistant and add them to our clean dictionary.
+    if 'token' in request.headers:
+        upstream_headers['token'] = request.headers['token']
+        logger.info("Found and added 'token' header to upstream request.")
+    
+    if 'Content-Type' in request.headers:
+        upstream_headers['Content-Type'] = request.headers['Content-Type']
+    # --- END OF THE FINAL FIX ---
+    
+    data = request.get_data()
+    
     try:
         resp = requests.request(
             method=request.method,
             url=url,
-            headers=headers,
+            headers=upstream_headers,
             data=data,
             params=request.args,
             timeout=30
         )
-
-        if resp.status_code != 200:
-            logger.error(f"Upstream API Error. Status: {resp.status_code}, Body: {resp.text[:500]}")
-            return jsonify({"error": "Upstream API Error", "status_code": resp.status_code, "details": resp.text[:500]}), resp.status_code
-
-        if 'application/json' not in resp.headers.get('Content-Type', ''):
-            logger.error(f"Upstream API did not return JSON. Body: {resp.text[:500]}")
-            return jsonify({"error": "Upstream API did not return JSON", "details": resp.text[:500]}), 502
-
+        
+        # Forward the entire response from Sunways back to Home Assistant
         excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
         headers_to_forward = [(name, value) for (name, value) in resp.raw.headers.items() if name.lower() not in excluded_headers]
         
@@ -58,7 +60,7 @@ def proxy(subpath):
 
     except requests.exceptions.RequestException as e:
         logger.error(f"Proxy request to Sunways failed: {e}")
-        return jsonify({"error": "Proxy request failed", "details": str(e)}), 502
+        return Response(f"Proxy Error: {e}", status=502)
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
