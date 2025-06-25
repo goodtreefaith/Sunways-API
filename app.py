@@ -1,4 +1,4 @@
-# app.py for Render.com (Maximum Debugging Version)
+# app.py for Render.com (Final "Less is More" Version)
 import os
 import requests
 from flask import Flask, request, Response
@@ -12,25 +12,25 @@ TARGET_BASE_URL = "https://api.sunways-portal.com"
 
 @app.route('/<path:subpath>', methods=['GET', 'POST'])
 def proxy(subpath):
+    """
+    A minimal proxy that only forwards the essential headers required by the API,
+    avoiding any extra headers that might confuse it.
+    """
     url = f"{TARGET_BASE_URL}/{subpath}"
     logger.info(f"--- New Request ---")
     logger.info(f"Proxying {request.method} for path: {subpath}")
 
-    upstream_headers = {
-        'Accept': 'application/json, text/javascript, */*; q=0.01',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'X-Requested-With': 'XMLHttpRequest',
-        'ver': 'pc',
-        'Origin': 'https://www.sunways-portal.com',
-        'Referer': 'https://www.sunways-portal.com/',
-    }
+    # Create a minimal set of headers for the upstream request.
+    upstream_headers = {}
 
-    if 'token' in request.headers:
-        upstream_headers['token'] = request.headers['token']
-        logger.info(f"Forwarding token: ...{request.headers['token'][-10:]}")
-    
+    # The API requires Content-Type for POST login requests.
     if 'Content-Type' in request.headers:
         upstream_headers['Content-Type'] = request.headers['Content-Type']
+    
+    # The API requires the token for data requests.
+    if 'token' in request.headers:
+        upstream_headers['token'] = request.headers['token']
+        logger.info("Forwarding essential 'token' header.")
     
     data = request.get_data()
     
@@ -44,23 +44,13 @@ def proxy(subpath):
             timeout=30
         )
         
-        # --- MAXIMUM DEBUGGING ---
         logger.info(f"--- Response from Sunways API ---")
         logger.info(f"  Status Code: {resp.status_code}")
-        logger.info(f"  Headers: {resp.headers}")
-        # Try to decode the content, but don't fail if it's not text
-        try:
-            body_preview = resp.content.decode('utf-8', errors='replace')
-        except:
-            body_preview = str(resp.content)
-        logger.info(f"  Full Body: {body_preview}")
-        # --- END DEBUGGING ---
-
+        logger.info(f"  Content-Type: {resp.headers.get('Content-Type')}")
+        
+        # Forward the response back to Home Assistant
         excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
-        headers_to_forward = []
-        for name, value in resp.headers.items():
-            if name.lower() not in excluded_headers:
-                headers_to_forward.append((name, value))
+        headers_to_forward = [(name, value) for (name, value) in resp.headers.items() if name.lower() not in excluded_headers]
         
         response = Response(resp.content, resp.status_code, headers_to_forward)
         return response
