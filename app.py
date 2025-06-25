@@ -1,171 +1,130 @@
+# /path/to/your/proxy/project/app.py
+
+#!/usr/bin/env python3
 """
-Asynchronous client for the Sunways cloud API.
-
-Handles:
-  • Login with MD5→Base64 password
-  • JWT cookie/header management
-  • Automatic token refresh when expired
+Sunways API Proxy for Render.com with Session Management
+Fixes SSL handshake issues and properly forwards authentication sessions
 """
 
-from __future__ import annotations
-
-import asyncio
-import base64
-import hashlib
+import os
 import json
+import urllib.request
+import urllib.parse
+import ssl
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import logging
-from typing import Any
 
-import aiohttp
-from aiohttp.hdrs import SET_COOKIE
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-from .const import (
-    DEFAULT_CHANNEL,
-    HEADERS_COMMON,
-    LOGIN_ENDPOINT,
-    STATION_MORE_ENDPOINT,
-)
-
-_LOGGER = logging.getLogger(__name__)
-
-
-class SunwaysApiError(RuntimeError):
-    """Raised on HTTP errors or API-level error codes."""
-
-
-class SunwaysApiClient:
-    """Thin wrapper around aiohttp for the Sunways endpoints."""
-
-    def __init__(
-        self,
-        base_url: str,
-        email: str,
-        raw_password: str,
-        session: aiohttp.ClientSession,
-    ) -> None:
-        self._base = base_url.rstrip("/")
-        self._email = email
-        self._password = self._encode_password(raw_password)
-        self._session = session
-        self._token: str | None = None
-        self._lock = asyncio.Lock()
-        # Each instance gets its own copy of the headers
-        self._headers = HEADERS_COMMON.copy()
-
-    async def close(self) -> None:
-        """Close the underlying aiohttp session."""
-        if self._session and not self._session.closed:
-            await self._session.close()
-
-    # ------------------------------------------------------------------ #
-    # Public API                                                         #
-    # ------------------------------------------------------------------ #
-    async def get_station_data(self, station_id: str) -> dict[str, Any]:
-        """
-        Return JSON from /station_more.
-
-        If the stored JWT is missing or expired, refresh once automatically.
-        """
-        async with self._lock:
-            if self._token is None:
-                await self._login()
-
-            try:
-                return await self._fetch_station(station_id)
-            except SunwaysApiError as exc:
-                if "token" not in str(exc).lower() and "html" not in str(exc).lower():
-                    raise
-
-                _LOGGER.info("Token invalid or expired, re-logging in")
-                await self._login()
-                return await self._fetch_station(station_id)
-
-    # ------------------------------------------------------------------ #
-    # Internal helpers                                                   #
-    # ------------------------------------------------------------------ #
-    async def _login(self) -> None:
-        """POST /monitor/auth/login and manually extract the JWT from the Set-Cookie header."""
-        _LOGGER.info("Attempting to login to Sunways API")
-        payload = {
-            "email": self._email,
-            "password": self._password,
-            "channel": DEFAULT_CHANNEL,
-        }
-
-        # Use a temporary header without the token for the login request itself
-        login_headers = self._headers.copy()
-        login_headers.pop("token", None)
-
-        async with self._session.post(
-            f"{self._base}{LOGIN_ENDPOINT}",
-            json=payload,
-            headers=login_headers,
-        ) as resp:
-            text = await resp.text()
-            if resp.status != 200:
-                raise SunwaysApiError(f"Login HTTP {resp.status}: {text}")
-
-            body = await resp.json(content_type=None)
-            if body.get("code") != "1000000":
-                raise SunwaysApiError(
-                    f'Login error {body.get("code")}: {body.get("msg")}'
-                )
-
-            # Manually parse the Set-Cookie header to find the token
-            token_from_cookie = None
-            if SET_COOKIE in resp.headers:
-                # Simple parsing: find 'token=...' and grab value before ';'
-                cookie_header = resp.headers.get(SET_COOKIE, "")
-                parts = cookie_header.split(';')
-                for part in parts:
-                    part = part.strip()
-                    if part.startswith("token="):
-                        token_from_cookie = part.split('=', 1)[1]
-                        break
+class SunwaysProxyHandler(BaseHTTPRequestHandler):
+    """HTTP request handler that proxies requests to Sunways API with session management"""
+    
+    def log_message(self, format, *args):
+        """Override to use proper logging"""
+        logger.info(f"{self.address_string()} - {format % args}")
+    
+    def _send_cors_headers(self):
+        """Send CORS headers to allow cross-origin requests"""
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization, Cookie, X-Requested-With, ver')
+        self.send_header('Access-Control-Allow-Credentials', 'true')
+    
+    def do_OPTIONS(self):
+        """Handle preflight CORS requests"""
+        self.send_response(204, "No Content")
+        self._send_cors_headers()
+        self.end_headers()
+    
+    def _proxy_request(self, method):
+        """Generic proxy handler for GET and POST"""
+        try:
+            target_url = f"https://api.sunways-portal.com{self.path}"
+            logger.info(f"Proxying {method} request to: {target_url}")
             
-            self._token = token_from_cookie
+            post_data = b''
+            if method == 'POST':
+                content_length = int(self.headers.get('Content-Length', 0))
+                if content_length > 0:
+                    post_data = self.rfile.read(content_length)
+            
+            # Prepare headers for Sunways API, forwarding from client
+            headers = {key: value for key, value in self.headers.items() if key.lower() not in ['host', 'connection']}
+            headers['Host'] = 'api.sunways-portal.com'
 
-            if not self._token:
-                raise SunwaysApiError("Login succeeded but no 'token' cookie was set in the response header")
+            ssl_context = ssl.create_default_context()
+            req = urllib.request.Request(target_url, data=post_data, headers=headers, method=method)
+            
+            with urllib.request.urlopen(req, timeout=60, context=ssl_context) as response:
+                response_data = response.read()
+                response_code = response.getcode()
+                
+                logger.info(f"Sunways API responded with status: {response_code}")
+                
+                self.send_response(response_code)
+                
+                # Forward all headers from API to client, especially Content-Type
+                for header_name, header_value in response.headers.items():
+                    if header_name.lower() not in ['set-cookie', 'transfer-encoding', 'connection', 'content-encoding']:
+                        self.send_header(header_name, header_value)
 
-            # Store the token for all subsequent requests
-            self._headers["token"] = self._token
-            _LOGGER.info("Login successful, manually extracted token.")
-            _LOGGER.debug("Obtained JWT ending in …%s", self._token[-10:])
+                # --- START OF THE CRITICAL FIX ---
+                # Use get_all() to reliably get all Set-Cookie headers
+                cookie_headers = response.headers.get_all('Set-Cookie')
+                if cookie_headers:
+                    for cookie in cookie_headers:
+                        self.send_header('Set-Cookie', cookie)
+                        logger.info(f"SUCCESS: Forwarding Set-Cookie header: {cookie}")
+                else:
+                    logger.warning("WARNING: No Set-Cookie header found in response from Sunways API.")
+                # --- END OF THE CRITICAL FIX ---
+                
+                self._send_cors_headers()
+                self.end_headers()
+                self.wfile.write(response_data)
+                
+        except urllib.error.HTTPError as e:
+            logger.error(f"HTTP error from Sunways API: {e.code} - {e.reason}")
+            error_data = e.read()
+            self.send_response(e.code)
+            self.send_header('Content-Type', 'application/json')
+            self._send_cors_headers()
+            self.end_headers()
+            self.wfile.write(error_data)
+        except Exception as e:
+            logger.error(f"Unexpected error in proxy: {str(e)}", exc_info=True)
+            self._send_error_response(500, f"Internal proxy error: {str(e)}")
 
+    def do_GET(self):
+        self._proxy_request('GET')
 
-    async def _fetch_station(self, station_id: str) -> dict[str, Any]:
-        """GET /station_more?id=… and return parsed JSON."""
-        url = f"{self._base}{STATION_MORE_ENDPOINT}?id={station_id}"
+    def do_POST(self):
+        self._proxy_request('POST')
 
-        # The 'token' is now manually added to the instance headers
-        async with self._session.get(url, headers=self._headers) as resp:
-            text = await resp.text()
+    def _send_error_response(self, status_code, message):
+        """Send a JSON error response"""
+        self.send_response(status_code)
+        self.send_header('Content-Type', 'application/json')
+        self._send_cors_headers()
+        self.end_headers()
+        error_data = {"error": message, "status": status_code}
+        self.wfile.write(json.dumps(error_data).encode())
 
-            if resp.status != 200:
-                raise SunwaysApiError(f"Station HTTP {resp.status}: {text}")
+def run_server():
+    """Start the proxy server"""
+    port = int(os.environ.get('PORT', 8080))
+    server_address = ('0.0.0.0', port)
+    httpd = HTTPServer(server_address, SunwaysProxyHandler)
+    
+    logger.info(f"Starting Sunways Proxy Server on port {port}")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    httpd.server_close()
+    logger.info("Server stopped.")
 
-            if text.lstrip().startswith("<!DOCTYPE html>"):
-                raise SunwaysApiError("Token invalid – got HTML instead of JSON")
-
-            try:
-                return json.loads(text)
-            except ValueError as err:
-                raise SunwaysApiError(f"Bad JSON: {err}") from err
-
-    # ------------------------------------------------------------------ #
-    # Static helpers                                                     #
-    # ------------------------------------------------------------------ #
-    @staticmethod
-    def _encode_password(raw: str) -> str:
-        """
-        Portal JS does: md5(password) → hex → Base64.
-
-        If the user already supplied something that *looks* Base64,
-        respect it to avoid double-encoding.
-        """
-        if raw.endswith("=") and len(raw) >= 22:
-            return raw
-
-        md5_hex = hashlib.md5(raw.encode()).hexdigest()
-        return base64.b64encode(md5_hex.encode()).decode()
+if __name__ == '__main__':
+    run_server()
