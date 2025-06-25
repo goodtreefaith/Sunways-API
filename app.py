@@ -1,4 +1,4 @@
-# app.py for Render.com (Final version with correct header filtering)
+# app.py for Render.com (Maximum Debugging Version)
 import os
 import requests
 from flask import Flask, request, Response
@@ -12,23 +12,22 @@ TARGET_BASE_URL = "https://api.sunways-portal.com"
 
 @app.route('/<path:subpath>', methods=['GET', 'POST'])
 def proxy(subpath):
-    """
-    A deliberate proxy that explicitly constructs headers and filters response headers
-    to prevent content encoding mismatches.
-    """
     url = f"{TARGET_BASE_URL}/{subpath}"
+    logger.info(f"--- New Request ---")
     logger.info(f"Proxying {request.method} for path: {subpath}")
 
     upstream_headers = {
         'Accept': 'application/json, text/javascript, */*; q=0.01',
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'X-Requested-With': 'XMLHttpRequest',
-        'ver': 'pc'
+        'ver': 'pc',
+        'Origin': 'https://www.sunways-portal.com',
+        'Referer': 'https://www.sunways-portal.com/',
     }
 
     if 'token' in request.headers:
         upstream_headers['token'] = request.headers['token']
-        logger.info("Added 'token' header to upstream request.")
+        logger.info(f"Forwarding token: ...{request.headers['token'][-10:]}")
     
     if 'Content-Type' in request.headers:
         upstream_headers['Content-Type'] = request.headers['Content-Type']
@@ -45,17 +44,24 @@ def proxy(subpath):
             timeout=30
         )
         
-        # --- START OF THE FINAL FIX ---
-        # These headers are managed by the connection and can cause issues if forwarded.
-        # Crucially, we remove 'Content-Encoding' because `requests` automatically decompresses the body.
+        # --- MAXIMUM DEBUGGING ---
+        logger.info(f"--- Response from Sunways API ---")
+        logger.info(f"  Status Code: {resp.status_code}")
+        logger.info(f"  Headers: {resp.headers}")
+        # Try to decode the content, but don't fail if it's not text
+        try:
+            body_preview = resp.content.decode('utf-8', errors='replace')
+        except:
+            body_preview = str(resp.content)
+        logger.info(f"  Full Body: {body_preview}")
+        # --- END DEBUGGING ---
+
         excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
         headers_to_forward = []
         for name, value in resp.headers.items():
             if name.lower() not in excluded_headers:
                 headers_to_forward.append((name, value))
-        # --- END OF THE FINAL FIX ---
         
-        # Create and return the response with the decompressed content and clean headers.
         response = Response(resp.content, resp.status_code, headers_to_forward)
         return response
 
